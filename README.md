@@ -1,191 +1,243 @@
-# Loyalty Feature – Technical Analysis
+# Android Technical Assessment & Engineering Governance Document  
+## Loyalty Feature (Rewards / Loyalty Menu & Apply Loyalty)
 
-**Document purpose:** Technical analysis for the Loyalty (Rewards / Loyalty Menu & Apply Loyalty) feature in POS and SmartPanel.  
-**Audience:** Development team.  
-**Reference:** Internal technical assessment; PRD/Figma references to be added if available.
+**Before Starting Development** please consider going over this document: *Android Best Practices.docx*
 
----
+### Purpose
 
-## 1. What Is the Change?
+This document ensures that every Android feature implementation:
 
-### 1.1 Business change
+- Evaluates existing module quality before modification
+- Preserves architectural integrity
+- Prevents uncontrolled technical debt
+- Assesses performance and memory impact
+- Documents trade-offs explicitly
+- Maintains long-term maintainability and scalability
 
-**Current (before Loyalty):** Staff could not redeem loyalty rewards from POS. There was no tier-based loyalty menu, no way to add loyalty items to a ticket, and no display of customer loyalty points or eligible items on customer-facing screens.
-
-**New:** With Loyalty implemented:
-
-- **Loyalty menu:** Staff can open a loyalty/rewards menu (from Guest Book / SmartPanel) showing tier-based items. Items are grouped by tier; customer’s current tier determines which items are eligible.
-- **Add to ticket:** Staff can add a selected loyalty item to the current ticket (QSR: offline add to ticket; TSR: apply-loyalty flow). The item is added with modifiers (and required modifiers) and appears on the ticket with loyalty tier/points.
-- **Customer info:** When a customer is associated with a ticket, the app can show loyalty points (available/used), tier, and eligible items. Customer-facing display (CFD) can show loyalty profile, points, and eligible items.
-- **Persistence:** Loyalty tier and points are stored on ticket/ticket items (e.g. `isLoyaltyApplied`, `loyaltyPointsApplied`, `loyalty_tiers_table` in Room) and reflected on receipts.
-
-### 1.2 Product / UX change
-
-| Aspect | Detail |
-|--------|--------|
-| **Location** | **SmartPanel / Guest Book:** Loyalty menu dialog (grid of tier headers + loyalty items). **Register (QSR/TSR):** Modifier panel flow when user selects a loyalty item from SmartPanel; “done” adds the item to the ticket. **CFD:** Loyalty profile view (login, points, tiers, eligible items). **Secondary screen:** Loyalty presentation (items by tier, tap to select). |
-| **New control** | “Loyalty” entry point in Guest Book → opens **Loyalty Menu** dialog. In the dialog, each loyalty item is tappable; on tap the dialog dismisses and the selected item is sent to the Register modifier flow (QSR/TSR). Print/receipt flows show loyalty-related data where applicable. |
-| **Scope** | **QSR:** Offline add of loyalty item to ticket (item + modifiers pushed to local DB; sync per existing ticket flow). **TSR:** Apply-loyalty API can update ticket with loyalty application; offline add also supported. **Sources:** Works for dine-in, takeout, delivery, etc.; behaviour may vary by order type. **Not in scope for this analysis:** mPOS-specific behaviour; exact TSR vs QSR apply-loyalty API usage by product. |
-| **On tap (Loyalty item)** | Guest Book → Loyalty item tap → `SmartPanelActions.OnLoyaltyItemClicked` → Register (QSR/TSR) receives action, opens modifier panel with that item pre-selected; user configures modifiers and confirms → item is added to ticket (offline or via apply-loyalty where applicable). Success: item on ticket; secondary screen can show ticket presentation. |
-| **Customer info** | When customer is set on ticket, SmartPanel/CFD can show points (available/used), tier, and eligible items. Customer info is loaded via **getSmartPanelCustomerInfo** API and cached in repository. |
-
-### 1.3 Technical change (summary)
-
-- **New UI:** Loyalty menu dialog (`LoyaltyMenuDialogFragment`), loyalty item adapters (`LoyaltyMenuAdapter`, `LoyaltyPresentationAdapter`), loyalty secondary screen, and CFD loyalty views. Register modifier panels (QsrMenuFragment, TsrMenuFragment) handle “loyalty item selected” and add-to-ticket flow.
-- **New flows:** (1) Load loyalty menu via **getLoyaltyMenu** API → cache in repository → expose via `loyaltyMenu` / `menuItemsFlow`. (2) On loyalty item click → `SmartPanelSharedViewModel.triggerSmartPanelAction(OnLoyaltyItemClicked)` → Register subscribes and sets `selectedLoyaltyModel`, opens modifier UI → on done, `addLoyaltyItemOffline` (or apply-loyalty) runs. (3) Customer info: **getSmartPanelCustomerInfo** API → cache → StateFlow to UI.
-- **New data:** Room table `loyalty_tiers_table` (`LoyaltyEntity`); ticket item fields for loyalty (e.g. `isLoyaltyApplied`, `loyaltyPointsApplied`). MenuDao: `getLoyaltyItem(itemId, modifierOptionId)`, `loyaltyPointsUsed`, etc.
-- **Reuse:** Existing ticket/item APIs, modifier panels, MQTT/ticket sync, printer/receipt formatting. KDS print path is unchanged; loyalty is ticket/item and customer-display focused.
+This assessment is **mandatory** for all L3 and L4 complexity tickets and **recommended** for L2.
 
 ---
 
-## 2. How Is It Implemented?
+## 1. Feature Overview
 
-### 2.1 High-level flow
+- **Jira Ticket:** _[To be filled if applicable]_
+- **Feature Name:** Loyalty (Rewards / Loyalty Menu & Apply Loyalty)
+- **Module / Layer Affected:** UI (Register – QSR/TSR, SmartPanel Guest Book, Secondary Screen, CFD); Domain (SmartPanel domain models, loyalty use flows); Data (Room, Retrofit APIs); Cross-module (Register ↔ SmartPanel, commons)
+- **Tech Lead / Owner:** _[To be filled]_
+- **Estimated Complexity:** **L3** (multi-module, offline/online flows, DB + API, cross-module dependencies)
+- **Initial Risk Level:** **Medium**
+- **Dependencies:** Internal: Menu DB (Room), Ticket APIs, SmartPanel APIs, SharedDataRepository, MenuTicketRepository; External: Retrofit (GET loyalty/pos-menu, POST ticket/apply-loyalty, GET customer/smartPanel); Infra: New Relic logging
+- **Target Release Date:** _[Already released – assessment is retrospective]_
 
-1. **Loyalty menu visibility and loading**
-   - Guest Book (or equivalent) shows entry to Loyalty menu. On open, `GuestBookViewModel.getLoyaltyMenu()` is called (or menu is taken from `menuItemsFlow`).
-   - `SmartPanelRepository.getLoyaltyMenu(isFromMqtt)` calls **GET api/loyalty/pos-menu**. Response is mapped to `BaseLoyaltyItem` list (tiers + items), cached in `SmartPanelRepositoryImpl.menuItems`, and exposed via `loyaltyMenu` StateFlow and `menuItemsFlow`.
-   - `LoyaltyMenuDialogFragment` collects `loyaltyMenu` and/or `menuItemsFlow` and shows loading/success/error; success fills `LoyaltyMenuAdapter` with tier headers and loyalty items.
+### Business Context
 
-2. **Loyalty item selection and add-to-ticket**
-   - User taps a loyalty item in the dialog → `onLoyaltyClick(loyalty)` → analytics + `smartPanelSharedViewModel.triggerSmartPanelAction(SmartPanelActions.OnLoyaltyItemClicked(loyalty.copy()))` → dialog dismisses.
-   - Register (QsrMenuFragment / TsrMenuFragment) subscribes to `smartPanelNav`; on `OnLoyaltyItemClicked` it sets `selectedLoyaltyModel = loyaltyItemModel`, loads modifiers for that item (`getCombinedModifierOfLoyaltyItemTimeBase`), and opens modifier panel (e.g. `setCustomerDetails(loyaltyItemModel, true)`). If no required modifiers, it may call `checkLoyalty()` immediately.
-   - When user confirms (e.g. modifier “Done”), Fragment calls `checkLoyalty()`: if `selectedLoyaltyModel != null`, it calls `smartPanelSharedViewModel.selectedLoyaltyModel.addLoyaltyItemOffline(...)` (extension in SmartPanelSharedViewModel) with current modifier list, special request, guest type, ticket id, order type. Then clears `selectedLoyaltyModel`.
-   - **addLoyaltyItemOffline:** Builds request entity and metadata, gets loyalty tier from `menuTicketRepository.getLoyaltyItem(...)`, calls `makeItemReadyCache`, then `menuTicketRepository.pushItemToDb(...)`, fetches latest item, and emits `SmartPanelActions.OnLoyaltyAppliedQsrOffline(loyaltyItem)`. UI (e.g. TSR) reacts by closing modifier panel and refreshing ticket.
-
-3. **Apply Loyalty (TSR / server-side)**
-   - Where product uses apply-loyalty API: `SmartPanelRepository.applyLoyalty(ApplyLoyaltyRequestModel)` calls **POST api/ticket/apply-loyalty**. Response includes updated ticket data. Used when ticket is applied with loyalty on the server; POS may then refresh ticket state.
-
-4. **Customer info and points**
-   - When customer is set on ticket, `SmartPanelSharedViewModel.setCustomerInfo(customer, isLoyaltyApplied, loyaltyPointsUsed)` is called. It calls `smartPanelRepository.getSmartPanelCustomerInfo(customerId, ...)` → **GET api/customer/smartPanel?customerId=**. Result is cached in `customersInfoList` and emitted via `customerInfo` StateFlow. LoyaltyMenuDialogFragment (and CFD) collect this and show points (e.g. `loyaltyPoints - loyaltyPointsUsed`), tier, and eligible items.
-
-5. **Visibility rules**
-   - Loyalty menu is shown from Guest Book / SmartPanel entry points. “Print to KDS” style visibility (Active tab, serveType, orderSource) does not apply to Loyalty; Loyalty is available in the Register + SmartPanel flows where Guest Book and ticket context exist.
-
-### 2.2 Implementation steps (as implemented in POS app)
-
-| Step | Task | Notes |
-|------|------|------|
-| 1 | **Commons – data model** | `LoyaltyEntity` in commons (Room entity for `loyalty_tiers_table`). Used by MenuDao and menu sync. |
-| 2 | **API layer** | Retrofit: `getLoyaltyMenu()`, `applyLoyalty(ApplyLoyaltyRequestModel)`, `getSmartPanelCustomerInfo(customerId)`. Implemented in `RetrofitAPIService`. |
-| 3 | **Repository** | `SmartPanelRepository` / `SmartPanelRepositoryImpl`: `getLoyaltyMenu`, `applyLoyalty`, `getSmartPanelCustomerInfo`, `clearCustomerInfo`, `clearMenuList`. In-memory cache: `menuItems`, `customersInfoList`. `MenuTicketRepository.getLoyaltyItem(itemId, modifierOptionId)` delegates to `GetAllMenuUseCase` / MenuDao. |
-| 4 | **ViewModels** | `GuestBookViewModel`: exposes `loyaltyMenu` StateFlow, calls `getLoyaltyMenu()`. `SmartPanelSharedViewModel`: `customerInfo` StateFlow, `setCustomerInfo`, `triggerSmartPanelAction`, extension `LoyaltyItemModel.addLoyaltyItemOffline(...)` that uses MenuTicketRepository, GetAllMenuUseCase, SharedDataRepository. |
-| 5 | **Loyalty menu UI** | `LoyaltyMenuDialogFragment`: collects `loyaltyMenu` and `menuItemsFlow`, shows loading/error/success; `LoyaltyMenuAdapter` with tier headers and items; on item click emits `OnLoyaltyItemClicked` and dismisses. |
-| 6 | **Register integration** | QsrMenuFragment / TsrMenuFragment: `selectedLoyaltyModel`, subscribe to `smartPanelNav` for `OnLoyaltyItemClicked`, `OnLoyaltyApplied`, `OnLoyaltyAppliedQsrOffline`. `checkLoyalty()` calls `addLoyaltyItemOffline` and clears selection. Modifier panel shows “loyalty” context (e.g. `isLoyalty` flag). |
-| 7 | **Secondary screen / CFD** | `LoyaltyPresentationAdapter`, `LoyaltySecondaryScreen` for secondary display. CFD: `MarketingCfdExtension` (e.g. `updateLoyaltyProfileView`, `showSignInLoyaltyView`) and related layouts. |
-| 8 | **Domain / mappers** | `LoyaltyItemModel`, `ApplyLoyaltyRequestModel`, `BaseLoyaltyItem`, `CustomerModel` (loyalty fields). `LoyaltyMappers.kt`: API response → `BaseLoyaltyItem` list. |
-| 9 | **Room** | `MenuDao`: `getLoyaltyItem`, `insertLoyaltyEntityAsList`, `loyaltyPointsUsed`, and ticket-item loyalty fields. `GetAllMenuUseCase`: `getLoyaltyItem`, `getLoyaltyItemModifiersTimeBaseMenu`, `isLoyaltyApplied`, `loyaltyPointsUsed`. |
-| 10 | **Strings / analytics** | String resources for loyalty UI; analytics e.g. `Analytics().postLoyaltyItemSelected(...)`. New Relic logging (e.g. LOYALTY_APPLIED, GUEST_BOOK_CUSTOMER_INFO). |
-
-### 2.3 Flow diagrams (reference)
-
-**Loyalty item add-to-ticket (QSR-style):**  
-Guest Book → Open Loyalty menu → getLoyaltyMenu API (or cache) → User taps item → OnLoyaltyItemClicked → Register sets selectedLoyaltyModel, opens modifier panel → User configures modifiers, taps Done → checkLoyalty() → addLoyaltyItemOffline → pushItemToDb → OnLoyaltyAppliedQsrOffline → UI updates → End.
-
-**Customer info:**  
-Ticket has customer → setCustomerInfo(customer, …) → getSmartPanelCustomerInfo API → cache → customerInfo StateFlow → LoyaltyMenuDialogFragment / CFD set points and tier → End.
-
-**Button visibility (conceptual):**  
-Loyalty menu entry is shown in Guest Book / SmartPanel when feature is available. “Print to KDS” style (Active tab, serveType, orderSource) does not govern Loyalty; visibility is by screen (Guest Book) and ticket/customer context.
+- **Problem being solved:** Allow guests to redeem loyalty rewards (tier-based items) from POS and SmartPanel; support offline add-to-ticket for QSR and apply-loyalty flow for TSR; show customer loyalty info and points on customer-facing displays.
+- **Expected user impact:** Staff can add loyalty items to tickets (QSR/TSR), view loyalty menu by tier, and see customer points/tiers; customers see loyalty profile and eligible items on CFD.
+- **Success criteria:** Loyalty menu loads, items can be added offline/online, customer info and points display correctly, and loyalty tier/points are persisted and reflected on tickets and receipts.
 
 ---
 
-## 3. Is There Any Tech Debt to Handle Before (or After) This Feature?
+## 2. Existing Code Review (Mandatory Pre-Implementation Step)
 
-**Short answer:** No blocking tech debt for the feature as already implemented. The following are recommended improvements for maintainability and consistency; none block current behaviour.
+The feature owner must review the current state of the affected module before implementation.
 
-- **Loyalty selection state in Fragment:** `selectedLoyaltyModel` and related flags live in `QsrMenuFragment` / `TsrMenuFragment` instead of a ViewModel. On configuration change, selection can be lost. **Recommendation:** Move to ViewModel or SavedStateHandle when touching this flow (backlog).
-- **Business logic in Fragment:** `checkLoyalty()` and “when to call addLoyaltyItemOffline” live in the Fragment. **Recommendation:** Move decision and invocation into ViewModel when refactoring (backlog).
-- **Unscoped coroutine in repository:** `SmartPanelRepositoryImpl.orderOutUpdateJob()` uses `CoroutineScope(Default).launch { while(true) { … } }` and is not cancelled with repository lifecycle. **Recommendation:** Fix by using a scope tied to repository or injected scope (should fix in a near-term iteration).
-- **Duplicate flow collection in LoyaltyMenuDialogFragment:** Both `guestBookViewModel.loyaltyMenu` and `guestBookViewModel.menuItemsFlow` are collected and both drive `observedLoyaltyMenu()`. **Recommendation:** Use a single source (e.g. only `menuItemsFlow`) to avoid redundant updates (quick fix).
-- **No unit/integration tests for Loyalty:** No loyalty-specific tests found. **Recommendation:** Add repository/ViewModel unit tests and critical-path integration tests (next sprint).
-- **Extension function on domain in ViewModel:** `LoyaltyItemModel.addLoyaltyItemOffline()` is defined inside SmartPanelSharedViewModel. **Recommendation:** Optional refactor when touching loyalty flow (e.g. move to use case or repository).
+### 2.1 Architecture & Layering Review
 
-**Optional (non-blocking):**  
-If more “optional” actions per screen appear (e.g. multiple print-like actions), consider a small abstraction (e.g. secondary actions list) instead of hard-coding each. Not required for Loyalty.
+- **ViewModel responsibility boundaries:** GuestBookViewModel is thin (delegates loyalty menu to SmartPanelRepository, exposes loyaltyMenu and menuItemsFlow). SmartPanelSharedViewModel carries significant loyalty logic: customer info, smart panel actions, and loyalty add-to-ticket via extension `LoyaltyItemModel.addLoyaltyItemOffline()`; coordinates MenuTicketRepository, GetAllMenuUseCase, SharedDataRepository. Latter ViewModel is moderately large and mixes coordination with domain-like behaviour.
+- **Repository abstraction correctness:** SmartPanelRepository defines getLoyaltyMenu, applyLoyalty, getSmartPanelCustomerInfo, clearCustomerInfo, clearMenuList; implementation uses Retrofit and in-memory cache (menuItems, customersInfoList). MenuTicketRepository exposes getLoyaltyItem(itemId, modifierOptionId) for Room. Abstraction is present but repository holds mutable in-memory state without bounds.
+- **UseCase / Domain isolation:** GetAllMenuUseCase exposes getLoyaltyItem, getLoyaltyItemModifiersTimeBaseMenu, isLoyaltyApplied, loyaltyPointsUsed (delegate to MenuRepository). Domain models: LoyaltyItemModel, ApplyLoyaltyRequestModel, CustomerModel (loyalty fields). No dedicated LoyaltyUseCase; loyalty flows are split across ViewModel, repository, and Fragment.
+- **Separation of concerns validation:** Violation: selectedLoyaltyModel and when to call checkLoyalty() live in QsrMenuFragment and TsrMenuFragment (UI layer). Business rule “add loyalty item to ticket” is triggered from Fragment but executed in ViewModel via extension. Fragment knows about SmartPanelActions (OnLoyaltyItemClicked, OnLoyaltyApplied, OnLoyaltyAppliedQsrOffline).
+- **Cross-module dependency violations:** Register (QSR/TSR) depends on SmartPanel’s SmartPanelSharedViewModel, SmartPanelActions, LoyaltyItemModel. SmartPanel depends on MenuTicketRepository, GetAllMenuUseCase, SharedDataRepository. No clear loyalty domain module; loyalty is spread across pos, smartPanel, commons.
+- **DI graph integrity:** Hilt used (@AndroidEntryPoint, @HiltViewModel, @Inject). SmartPanelRepositoryImpl receives RetrofitAPIService, BusinessIdUseCase, TsrDao; ViewModels receive repositories/use cases. No circular dependency observed.
 
----
+### 2.2 Concurrency & Coroutine Audit
 
-## 4. Where Is the Impact in the Code?
+- **Dispatcher correctness:** ViewModels use viewModelScope.launch(IO) or Default for loyalty/customer work; Fragment uses lifecycleScope, repeatOnLifecycle, flowWithLifecycle. Loyalty mapper uses withContext(IO) for mapping (mapping is CPU-bound; IO not strictly necessary).
+- **Structured concurrency:** ViewModel and Fragment scopes used; no GlobalScope in loyalty paths.
+- **SupervisorJob misuse:** Not observed in loyalty code.
+- **Unscoped coroutines:** Issue: SmartPanelRepositoryImpl.orderOutUpdateJob() uses CoroutineScope(Default).launch { while(true) { … } } — unscoped; survives repository lifetime and is not cancelled when repository is no longer needed.
+- **Flow cold/hot misuse:** loyaltyMenu and menuItemsFlow are StateFlows (hot). Issue: In LoyaltyMenuDialogFragment, both guestBookViewModel.loyaltyMenu and guestBookViewModel.menuItemsFlow are collected and both drive observedLoyaltyMenu() — redundant and can cause duplicate UI updates.
+- **Backpressure handling:** StateFlow/SharedFlow used appropriately; cancellation follows lifecycle.
+- **Cancellation awareness:** Suspend functions used; no blocking calls in loyalty path on main thread.
 
-### 4.1 Module / layer overview
+### 2.3 Data Layer Review
 
-| Layer / area | Impact | Files / components (indicative) |
-|--------------|--------|----------------------------------|
-| **Commons** | Loyalty entity for Room | `commons/.../datamodels/LoyaltyEntity.kt` |
-| **POS – SmartPanel** | Repository, ViewModels, domain models, mappers, API DTOs | `smartPanel/data/repository/SmartPanelRepositoryImpl.kt`, `smartPanel/domain/repository/SmartPanelRepository.kt`, `smartPanel/presentation/.../viewmodel/GuestBookViewModel.kt`, `smartPanel/shared/SmartPanelSharedViewModel.kt`, `smartPanel/domain/model/guestBook/loyalties/*.kt`, `smartPanel/data/mapper/LoyaltyMappers.kt`, `smartPanel/data/remote/model/loyalty/*.kt` |
-| **POS – SmartPanel UI** | Loyalty menu dialog, adapters, secondary screen | `smartPanel/.../loyaltyMenu/loyaltyMenuFragment/LoyaltyMenuDialogFragment.kt`, `LoyaltyMenuAdapter.kt`, `smartPanel/.../secondaryScreen/LoyaltyPresentationAdapter.kt`, `LoyaltySecondaryScreen.kt` |
-| **POS – Register** | Loyalty selection and add-to-ticket in modifier flow | `ui/main/fragments/register/QsrMenuFragment.kt`, `TsrMenuFragment.kt` (selectedLoyaltyModel, checkLoyalty, OnLoyaltyItemClicked / OnLoyaltyApplied handling) |
-| **POS – Room / Data** | Loyalty queries and ticket item loyalty fields | `room/dao/MenuDao.kt`, `room/repository/MenuRepository.kt`, `room/repository/MenuRepositoryImpl.kt`, `room/usecases/GetAllMenuUseCase.kt`, `repositories/menus/MenuTicketRepository.kt`, `MenuTicketRepositoryImpl.kt` |
-| **POS – Network** | Loyalty and customer APIs | `network/RetrofitAPIService.kt` (getLoyaltyMenu, applyLoyalty, getSmartPanelCustomerInfo) |
-| **POS – CFD / Marketing** | Loyalty profile and points on customer-facing display | `utils/MarketingCfdExtension.kt`, `marketingcfd/MarketingScreenRepoImpl.kt`, related layouts (e.g. `customer_facing_ticket.xml`) |
-| **POS – Receipts / Print** | Loyalty data on receipts where applicable | `printers/PrinterTemplates.kt`, `printers/OnlineOrderReceipt.kt` (loyalty-related content if any) |
-| **Resources** | Strings, layouts | `res/values/strings.xml`, `res/layout/dialog_loyality_menu.xml`, `loyalty_presentation_item.xml`, `loyalty_presentation.xml`, etc. |
+- **Room queries performance:** MenuDao.getLoyaltyItem(itemId, modifierOptionId) — single row by composite key. loyaltyPointsUsed, isLoyaltyApplied on ticket items. insertLoyaltyEntityAsList for bulk insert. Queries are simple.
+- **Index usage validation:** LoyaltyEntity table loyalty_tiers_table has primary key (itemId, modifierOptionId) — index implied. No explicit index audit for other loyalty-related queries.
+- **N+1 query risks:** No N+1 observed in loyalty-specific code.
+- **Transaction correctness:** Ticket item updates use existing transaction patterns; no loyalty-specific transaction issues identified.
+- **Migration readiness:** LoyaltyEntity in MenuDatabase; migrations not inspected in this review.
+- **API error mapping:** safeApiCall used in repository; returns Resource.Success / Resource.Error. Errors propagated to UI via StateFlow.
 
-### 4.2 File-level impact (concise)
+### 2.4 UI & State Management Review
 
-- **commons/.../LoyaltyEntity.kt**  
-  Room entity for `loyalty_tiers_table` (itemId, modifierOptionId, loyaltyId, loyaltyName, loyaltyTier). Used by menu sync and MenuDao.
+- **Single source of truth validation:** Loyalty menu: repository holds cached menuItems and exposes via menuItemsFlow and getLoyaltyMenu(). selectedLoyaltyModel is Fragment state only — not in ViewModel — so no single source of truth for “currently selected loyalty item” across configuration change.
+- **Immutable UI state usage:** LoyaltyItemModel has var modifierGroup, var modifiers, var itemTaxes — mutable domain model. UI state in Fragment is mutable (selectedLoyaltyModel).
+- **StateFlow/LiveData misuse:** StateFlow used for loyaltyMenu, customerInfo, menuItemsFlow; SharedFlow for smartPanelNav. No LiveData in loyalty flow. Duplicate collection of loyalty menu flows in LoyaltyMenuDialogFragment is a misuse (two sources driving same UI).
+- **One-time event handling:** SmartPanelActions (e.g. OnLoyaltyItemClicked, OnLoyaltyApplied) delivered via SharedFlow — appropriate for one-time events.
+- **Configuration change safety:** Risk: selectedLoyaltyModel and loyalty-related flags in QsrMenuFragment/TsrMenuFragment are lost on configuration change unless saved in SavedStateHandle or ViewModel.
+- **Compose recomposition risks:** Not applicable; traditional Views/Fragments used for loyalty UI.
 
-- **pos/.../SmartPanelRepository.kt & SmartPanelRepositoryImpl.kt**  
-  `getLoyaltyMenu(isFromMqtt)`, `applyLoyalty`, `getSmartPanelCustomerInfo`, `clearCustomerInfo`, `clearMenuList`. In-memory cache: `menuItems`, `customersInfoList`. API calls via Retrofit; safeApiCall and Resource.
+### 2.5 Performance & Memory Review
 
-- **pos/.../GuestBookViewModel.kt**  
-  `loyaltyMenu` StateFlow, `getLoyaltyMenu()` (launches IO, emits Loading then result). Exposes `menuItemsFlow` from repository.
+- **Large ViewModels:** SmartPanelSharedViewModel holds loyalty add-to-ticket logic and multiple repositories; size is moderate but could grow.
+- **Memory leaks:** Fragment clears _binding in onDestroyView. ViewModel uses viewModelScope; no obvious context retention in loyalty code.
+- **Heavy object allocation:** Loyalty menu cached in repository (ArrayList<BaseLoyaltyItem>); customer list cached (customersInfoList). Could grow with many customers/menu items; no bounds.
+- **Bitmap handling:** Loyalty item images loaded in adapters (LoyaltyPresentationAdapter, LoyaltyMenuAdapter) via load() extension; caching not audited.
+- **RecyclerView inefficiencies:** Loyalty menus use RecyclerView/GridLayoutManager; no obvious inefficiency.
+- **Cold start impact:** Loyalty not on critical cold-start path; getLoyaltyMenu can be called when Guest Book / loyalty UI is opened.
+- **Frame drops risk:** No heavy work on main thread in loyalty UI; withContext(Main) used for adapter updates.
 
-- **pos/.../SmartPanelSharedViewModel.kt**  
-  `customerInfo` StateFlow, `setCustomerInfo`, `triggerSmartPanelAction`. Extension `LoyaltyItemModel.addLoyaltyItemOffline(allModifierList, specialRequest, guestType, ticketId, orderType)`: builds metadata and request, gets loyalty tier from MenuTicketRepository, calls makeItemReadyCache, pushItemToDb, then emits OnLoyaltyAppliedQsrOffline.
+### 2.6 Reliability & Stability
 
-- **pos/.../LoyaltyMenuDialogFragment.kt**  
-  Collects `loyaltyMenu` and `menuItemsFlow` (both drive same UI — consider removing one). Collects `customerInfo` for points/tier. LoyaltyMenuAdapter; on item click: analytics + triggerSmartPanelAction(OnLoyaltyItemClicked) + dismiss.
+- **Crash reports (last 30–90 days):** Not available in codebase; recommend checking for loyalty-related stack traces.
+- **ANR reports:** Not available in codebase.
+- **Unhandled exceptions:** Repository uses safeApiCall and try/catch in ViewModel with logging; exceptions mapped to Resource.Error.
+- **Error propagation strategy:** UI observes Resource.Loading / Success / Error and shows loading/error states in LoyaltyMenuDialogFragment.
+- **Retry logic correctness:** No explicit retry for getLoyaltyMenu or applyLoyalty in reviewed code; transient failures require user to retry manually.
 
-- **pos/.../QsrMenuFragment.kt & TsrMenuFragment.kt**  
-  `selectedLoyaltyModel`, subscription to smartPanelNav for OnLoyaltyItemClicked / OnLoyaltyApplied / OnLoyaltyAppliedQsrOffline. `checkLoyalty()`: if selectedLoyaltyModel != null, call addLoyaltyItemOffline then clear. Modifier panel shows loyalty context (e.g. isLoyalty).
+### 2.7 Test Coverage Assessment
 
-- **pos/.../MenuDao.kt**  
-  `getLoyaltyItem(itemId, modifierOptionId)`, `insertLoyaltyEntityAsList`, `loyaltyPointsUsed(ticketId, posRequestId)`, and ticket-item loyalty-related queries.
-
-- **pos/.../GetAllMenuUseCase.kt**  
-  `getLoyaltyItem`, `getLoyaltyItemModifiersTimeBaseMenu`, `isLoyaltyApplied`, `loyaltyPointsUsed` (delegate to MenuRepository).
-
-- **pos/.../RetrofitAPIService.kt**  
-  `getLoyaltyMenu()`, `applyLoyalty(@Body)`, `getSmartPanelCustomerInfo(@Query customerId)`.
-
-- **pos/.../LoyaltyMappers.kt**  
-  Maps API loyalty response (e.g. LoyaltyData) to `ArrayList<BaseLoyaltyItem>` (tiers + LoyaltyItemModel).
-
-- **Strings / layouts**  
-  Add or reuse strings for loyalty menu, points, errors. Layouts: dialog_loyality_menu, loyalty_presentation_item, loyalty_presentation, CFD loyalty sections.
-
-### 4.3 Existing code to reuse / not change
-
-- **KDS print path:** `printKDSPrintReceiptConnection`, PrinterTemplates (KDS format), MQTT KDS print handling — unchanged by Loyalty. Loyalty does not trigger KDS print from POS; it only affects ticket items and customer display.
-- **Ticket and modifier flows:** Existing ticket/item models, modifier panels, QsrModifierAdapter / QsrModifierGroupAdapter, and ticket DB push/pull are reused. Loyalty adds a “source” (loyalty item) and optional apply-loyalty API; core ticket and modifier logic stays.
-- **TicketData / TicketItem:** Already contain or are extended for loyalty fields (e.g. isLoyaltyApplied, loyaltyPointsApplied). Use as-is for visibility and API payloads.
-- **SharedDataRepository, MenuTicketRepository:** Used for selected ticket, posRequestId, pushItemToDb, getLoyaltyItem — no structural change required for Loyalty.
+- **Unit test coverage %:** No loyalty-specific unit tests found; effective coverage for loyalty flows is 0%.
+- **Integration test presence:** None found for loyalty flows.
+- **Flaky tests:** N/A.
+- **Missing edge-case tests:** All loyalty edge cases (menu load failure, apply failure, customer info failure, config change) are untested.
+- **Mocking anti-patterns:** N/A (no tests to evaluate).
 
 ---
 
-## 5. Acceptance Criteria (for QA)
+## 3. Identified Issues Log
 
-- Loyalty menu opens from Guest Book (or designated entry); shows tier headers and loyalty items; loading and error states work.
-- Tapping a loyalty item dismisses the dialog and Register (QSR/TSR) opens modifier panel with that item pre-selected; required modifiers are enforced where configured.
-- On modifier Done, the loyalty item is added to the current ticket (offline for QSR; TSR as per product flow). Item appears on ticket with correct modifiers and loyalty tier/points where applicable.
-- Customer info (points available/used, tier, eligible items) is shown when customer is set on ticket and after getSmartPanelCustomerInfo succeeds; CFD shows loyalty profile where configured.
-- Apply-loyalty API (when used) updates ticket as per backend contract; POS reflects updated ticket state.
-- Voided items are not included in loyalty application; fulfilled items are included per PRD/product rules.
-- Receipts and relevant prints show loyalty-related data where applicable.
-- No regression in non-loyalty flows (modifier panel, ticket list, payment, KDS print).
+Document all findings clearly.
+
+| Category | Issue Description | Severity | Risk Impact |
+|----------|-------------------|----------|-------------|
+| Architecture | Loyalty selection state in Fragment: selectedLoyaltyModel and related flags live in QsrMenuFragment/TsrMenuFragment instead of ViewModel. | Medium | State lost on config change; logic split between Fragment and ViewModel. |
+| Architecture | Business logic in Fragment: checkLoyalty() in Fragment decides when to call ViewModel’s addLoyaltyItemOffline and manipulates modifier list. | Medium | Harder to test and reuse; Fragment not single responsibility. |
+| Architecture | Extension function on domain model in ViewModel: LoyaltyItemModel.addLoyaltyItemOffline() is an extension defined in SmartPanelSharedViewModel; domain type coupled to ViewModel. | Low | Unusual coupling; complicates testing and reuse. |
+| Concurrency | Unscoped coroutine in repository: SmartPanelRepositoryImpl.orderOutUpdateJob() uses CoroutineScope(Default).launch { while(true) { … } }. | High | Job never cancelled; potential leak and work after repository no longer needed. |
+| UI / State | Duplicate flow collection in LoyaltyMenuDialogFragment: both loyaltyMenu and menuItemsFlow are collected and both call observedLoyaltyMenu(). | Medium | Redundant updates; possible race or double UI refresh. |
+| Data / State | Mutable domain model: LoyaltyItemModel has var for modifierGroup, modifiers, itemTaxes. | Low | Mutable shared state can lead to accidental mutation. |
+| Data | In-memory caches in repository: menuItems and customersInfoList in SmartPanelRepositoryImpl never bounded; can grow. | Low | Memory growth in long sessions or many customers. |
+| Reliability | No retry for loyalty API calls. | Low | Transient failures require user to retry manually. |
+| Test | No unit or integration tests for loyalty feature. | High | Regressions and refactors are risky. |
 
 ---
 
-## 6. Dependencies
+## 4. Improvement Decision Matrix (Mandatory)
 
-- **Backend:**  
-  - **GET api/loyalty/pos-menu** — returns loyalty menu (tiers and items).  
-  - **POST api/ticket/apply-loyalty** — applies loyalty to ticket (request/response per backend contract).  
-  - **GET api/customer/smartPanel?customerId=** — returns customer info including loyalty points, tier, and eligible items.
+For each identified issue:
 
-- **Internal:** Menu DB (Room) with `loyalty_tiers_table` and ticket-item loyalty fields; menu sync must populate loyalty tiers. Ticket and modifier flows; SharedDataRepository; MQTT/ticket sync unchanged.
+| Issue | Fix in Current Iteration? (Y/N) | Justification | Backlog Ticket | Target Sprint |
+|-------|---------------------------------|---------------|----------------|---------------|
+| selectedLoyaltyModel in Fragment | N | Requires refactor of QSR/TSR modifier flow and state ownership; high touch surface. | REFACTOR-LOYALTY-STATE | Backlog |
+| checkLoyalty in Fragment | N | Tied to issue above; move to ViewModel when state is moved. | REFACTOR-LOYALTY-STATE | Backlog |
+| addLoyaltyItemOffline extension in ViewModel | N | Low severity; refactor when touching loyalty flow. | REFACTOR-LOYALTY-VM | Backlog |
+| Unscoped orderOutUpdateJob | **Y** | Concurrency violation; must fix. Use scope tied to repository lifecycle or inject a scope. | FIX-ORDEROUT-SCOPE | Current/Next |
+| Duplicate loyalty flow collection | **Y** | Quick fix; remove one collector or unify source. | FIX-LOYALTY-DIALOG-COLLECTOR | Current/Next |
+| Mutable LoyaltyItemModel | N | Low impact; can be done with domain cleanup. | CLEANUP-LOYALTY-MODEL | Backlog |
+| Unbounded in-memory caches | N | Monitor; add limits or TTL if issues appear. | PERF-LOYALTY-CACHE | Backlog |
+| No retry for loyalty API | N | Enhancement; not blocking. | FEATURE-LOYALTY-RETRY | Backlog |
+| No tests for loyalty | **Y** | Critical for maintainability; add at least repository/ViewModel unit tests. | TEST-LOYALTY-COVERAGE | Next sprint |
 
-- **External:** Retrofit for HTTP; analytics and New Relic logging as per project standards.
+### Governance Rules
+
+- **Crash, ANR, or memory leak** → Must fix immediately. (None identified as direct crash/ANR/leak; unscoped coroutine is a concurrency violation.)
+- **Concurrency violation** → Must fix. (Issue 4: unscoped orderOutUpdateJob — **must fix.**)
+- **Architectural violation** → Explicit approval required. (Issues 1, 2, 3 documented; fix planned in backlog with approval.)
+- **Performance regression risk** → Must be benchmarked. (Unbounded caches documented; monitor; no immediate benchmark required.)
+- **No issue may be ignored without documentation.** (All issues documented and dispositioned in this matrix.)
+
+---
+
+## 5. Impact Assessment
+
+Evaluate downstream impact.
+
+### 5.1 UI Impact
+
+- **Layout changes?** Loyalty uses existing layouts (dialog_loyality_menu, loyalty_presentation_item, customer-facing loyalty views). No change required for this assessment.
+- **Navigation changes?** Loyalty menu opened as dialog; loyalty item click triggers SmartPanelActions.OnLoyaltyItemClicked and dismiss. Navigation is Fragment/Activity based; no structural change.
+- **State handling modifications?** Recommended: move selectedLoyaltyModel and loyalty flow flags into ViewModel or SavedStateHandle to survive configuration change and improve testability.
+
+### 5.2 API Contract Impact
+
+- **Request/response changes?** Endpoints used: GET api/loyalty/pos-menu, POST api/ticket/apply-loyalty, GET api/customer/smartPanel. No change in this assessment.
+- **Error model changes?** Handled via existing ResultNew / Resource; no versioning change.
+- **Versioning required?** No.
+
+### 5.3 Database Impact
+
+- **Schema changes?** loyalty_tiers_table (LoyaltyEntity); ticket item tables store loyalty-related fields (e.g. loyaltyPointsApplied, isLoyaltyApplied). No change in this assessment.
+- **Migration needed?** Not required for current assessment.
+- **Data backfill required?** No.
+- **Rollback feasibility?** No schema change proposed; rollback of app version follows standard process.
+
+### 5.4 Performance Impact
+
+- **CPU impact:** Loyalty menu mapping and DB lookups are light; add-to-ticket flow does DB and repository work on IO dispatcher.
+- **Memory footprint:** In-memory loyalty menu and customer list in repository; recommend monitoring or capping in future.
+- **Network payload size:** Loyalty menu and customer info fetched on demand; apply-loyalty on user action; no disproportionate payload.
+- **Startup time impact:** Loyalty not on critical cold-start path.
+- **Expected load increase:** Tied to number of loyalty menu items and concurrent customer info requests; no blocking concern identified.
+
+### 5.5 Backward Compatibility
+
+- **Feature flags required?** Not observed in loyalty code; any rollout would be app-level.
+- **Gradual rollout?** Per product decision; no technical blocker.
+- **Legacy support maintained?** Existing tickets and loyalty data must remain readable; no breaking change identified.
+
+---
+
+## 6. Risk Assessment
+
+| Risk | Probability | Impact | Mitigation Strategy |
+|------|--------------|--------|---------------------|
+| Configuration change loses selected loyalty item | Medium | Medium | Move selection state to ViewModel / SavedStateHandle; backlog ticket created. |
+| Unscoped coroutine causes leak or unnecessary work | High | Medium | Fix orderOutUpdateJob scope (tied to repository or injected scope) — must fix. |
+| Duplicate flow collection causes UI glitches | Low | Low | Remove redundant collector in LoyaltyMenuDialogFragment. |
+| No tests lead to regressions | High | High | Add unit tests for repository and ViewModel loyalty flows (next sprint). |
+| API or DB change breaks loyalty | Low | High | Maintain API contract; add integration tests for critical paths. |
+
+### Rollback strategy
+
+Revert app version; no server-side loyalty contract change assumed. If backend contract changes, coordinate with backend team for backward compatibility or versioned endpoints.
+
+### Monitoring plan
+
+Use existing New Relic / logging for loyalty (e.g. LOYALTY_APPLIED, GUEST_BOOK_CUSTOMER_INFO). Add or review alerts on loyalty API error rate and apply-loyalty failures if available. Monitor crash/ANR reports for loyalty-related stack traces (last 30–90 days).
+
+---
+
+## 7. Final Approval
+
+| Role | Approval |
+|------|----------|
+| Engineering Manager Approval | _[To be filled]_ |
+| Platform Lead Approval | _[To be filled]_ |
+| Squad Lead Approval | _[To be filled]_ |
+| Product Acknowledgment | _[To be filled]_ |
+| **Date** | _[To be filled]_ |
+
+---
+
+## 8. Assessment Result
+
+**Summary:** The Loyalty feature is implemented and functional across POS (QSR/TSR) and SmartPanel (Guest Book, customer info, CFD). The assessment confirms **L3 complexity** and **Medium** initial risk, with no blocking tech debt that prevents current operation.
+
+**Mandatory actions:**
+
+1. **Fix concurrency violation:** Unscoped `orderOutUpdateJob` in SmartPanelRepositoryImpl must be fixed (scope tied to repository or injected).
+2. **Fix duplicate flow collection:** Remove or unify the duplicate loyalty menu collection in LoyaltyMenuDialogFragment.
+3. **Add test coverage:** Add at least repository and ViewModel unit tests for loyalty flows in the next sprint.
+
+**Backlog (documented, not ignored):**
+
+- Move loyalty selection state and checkLoyalty logic from Fragment to ViewModel (REFACTOR-LOYALTY-STATE).
+- Refactor addLoyaltyItemOffline out of ViewModel extension (REFACTOR-LOYALTY-VM).
+- Consider immutable LoyaltyItemModel and bounded caches (CLEANUP-LOYALTY-MODEL, PERF-LOYALTY-CACHE).
+- Optional: retry for loyalty API (FEATURE-LOYALTY-RETRY).
+
+**Governance compliance:** All identified issues are documented in the Issues Log and dispositioned in the Improvement Decision Matrix. Concurrency violation is marked for fix in current/next iteration; architectural items require explicit approval when scheduled. No issue is left undocumented.
+
+**Result:** **Conditionally approved** — feature may remain in production; mandatory fixes (unscoped coroutine, duplicate collector, test coverage) must be completed as per matrix. Final sign-off to be recorded in Section 7.
