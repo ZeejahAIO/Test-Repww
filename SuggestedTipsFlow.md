@@ -1,98 +1,100 @@
-# Suggested Tips Flow Diagram
+# Suggested Tips Flow — QSR vs TST
 
 ```mermaid
 flowchart TD
-    A([App Start / Splash]) --> B[Load TipSettings from API]
-    B --> C{Tips Enabled?\nareTipsEnabled}
-    C -- No --> D([Tips Disabled - Skip])
-    C -- Yes --> E[Store in Room DB\nTipSettingsEntity +\nSuggestedTipEntity list]
+    START([Order Ready for Payment]) --> CHECK{IS_QUICK_SERVE?}
 
-    E --> F([Order Created])
-    F --> G[Customer reaches\nPayment Screen]
+    %% ─────────────────────────────
+    %% QSR BRANCH
+    %% ─────────────────────────────
+    CHECK -- QSR --> QA[calculatePercentagesFromDb\nBuild 3 TipDisplayItems\nfallback: 18% / 20% / 22%]
 
-    G --> H[calculatePercentagesFromDb\nExtensions.kt]
-    H --> I{SuggestedTips in DB?}
-    I -- Yes --> J[Load from DB\norder, value%, isDefault]
-    I -- No --> K[Use Fallback:\n18%, 20%, 22%]
-    J --> L[Build TipDisplayItem list\npercentage + calculated amount]
-    K --> L
+    QA --> QB{Payment Method}
 
-    L --> M{Payment Method}
+    QB -- Card --> QC[SecondaryScreenUiState\nShowPayByCardTip\nPayByCardTipSecondaryScreen]
+    QB -- Tender/Cash --> QD[SecondaryScreenUiState\nShowPayByTenderTip\nPayByTenderTip]
+    QB -- Gift Card --> QE[ShowPayByGiftTipScreen]
 
-    M -- Card --> N[PayByCardTipSecondaryScreen\nShow 3 suggested tips\nHighlight default 2nd if none]
-    M -- Tender/Cash --> O[PayByTenderTip\nShow 3 suggested tips\n+ Custom Tip option]
-    M -- Gift Card --> P[ShowPayByGiftTipScreen\nShow tip options]
+    QC --> QF[Customer sees 3 suggested\ntip buttons + Custom Tip\nDefault pre-highlighted]
+    QD --> QF
+    QE --> QF
 
-    N --> Q{Customer Selection}
-    O --> Q
-    P --> Q
+    QF --> QG{Customer selects}
+    QG -- Suggested % --> QH[onTipSelect callback\ntipAmount returned]
+    QG -- Custom --> QI[Numpad input]
+    QG -- No Tip --> QJ[tipAmount = 0]
+    QI --> QH
 
-    Q -- Suggested Tip --> R[onTipSelect callback\ntipAmount passed back]
-    Q -- Custom Tip --> S[Numpad Input\nCustom Amount]
-    Q -- No Tip --> T[Proceed with\ntipAmount = 0]
-    S --> R
+    QH --> QK{Tip > 50% of total?}
+    QK -- Yes --> QL[Confirmation Dialog]
+    QL -- Confirmed --> QM
+    QL -- Cancel --> QF
+    QK -- No --> QM
 
-    R --> U{Tip > 50%\nof Order Total?\nisGreaterThan50percent}
-    U -- Yes --> V[Show Confirmation\nDialog]
-    V -- Confirm --> W[isTipAbove50Added = true]
-    V -- Cancel --> Q
-    U -- No --> W
+    QM[Total = Order + Tip\nAnalytics: postPaymentTipEntered]
+    QM --> QN[Payment processed\nwith tip included]
+    QN --> QO[printReceipt server\nReceipt shows actual tip paid]
+    QO --> QEND([QSR Done])
 
-    W --> X[Total = Order Amount\n+ Tip Amount]
-    X --> Y[postPaymentTipEntered\nAnalytics tracked]
-    Y --> Z[Payment Request Sent\nwith tipAmount in metadata]
-    Z --> AA([Payment Complete])
+    %% ─────────────────────────────
+    %% TST BRANCH
+    %% ─────────────────────────────
+    CHECK -- TST --> TA[Payment processed\nwith tip = 0.00]
+    TA --> TB{tip == 0.00?\nwillTipAddLater}
+    TB -- Yes --> TC[printReceiptLaterTip\nprinterViewModel\n.invokePayByCardWithTip]
+    TB -- No --> TD[printReceipt server\nnormal receipt]
 
-    %% --- Cash Tips Branch ---
-    AA --> BB{Cash Payment?}
-    BB -- Yes --> CC[AddTipSelectionDialog\nCash Tips tab]
-    CC --> DD[AddTipSelectionCash\nNumpad entry]
-    DD --> EE[dashBoardViewModel\n.submitCashTips]
-    EE --> FF[POST declared_tips\nto API]
-    FF --> GG([Cash Tip Declared])
+    TC --> TE[Receipt printed with\ntip1 / tip2 / tip3\nsuggested percentages]
+    TE --> TF[Server presents\nreceipt to customer]
+    TF --> TG{Customer writes\ntip on receipt?}
+    TG -- Yes --> TH[Server adds tip later\nvia AddTipSelectionDialog\nUnclosed Tickets tab]
+    TG -- No Tip --> TI([TST Done - No Tip])
 
-    %% --- Unclosed Tickets Branch ---
-    BB -- Card / Unclosed --> HH{Unclosed Tickets?}
-    HH -- Yes --> II[AddTipSelectionDialog\nUnclosed Tickets tab]
-    II --> JJ[AddTipSelectionUnclosed\nShow ticket list]
-    JJ --> KK[AddTipUnclosedFragment\nAddTipUnclosedNumPadView]
-    KK --> LL{Tip > 50%?}
-    LL -- Yes --> MM[Show Warning\nisTipAbove50Added flag]
-    LL -- No --> NN[updateTipAmount\non Adapter]
-    MM --> NN
-    NN --> OO([Tip Added to\nUnclosed Ticket])
+    TH --> TJ[AddTipUnclosedFragment\nAddTipUnclosedNumPadView]
+    TJ --> TK{Tip > 50%?}
+    TK -- Yes --> TL[Warning shown\nisTipAbove50Added = true]
+    TK -- No --> TM
+    TL --> TM[updateTipAmount on adapter\nTicket updated]
+    TM --> TEND([TST Done - Tip Added])
 
-    %% Styling
-    style A fill:#4CAF50,color:#fff
-    style D fill:#9E9E9E,color:#fff
-    style AA fill:#2196F3,color:#fff
-    style GG fill:#2196F3,color:#fff
-    style OO fill:#2196F3,color:#fff
-    style V fill:#FF9800,color:#fff
-    style MM fill:#FF9800,color:#fff
-    style K fill:#FF9800,color:#fff
+    %% ─────────────────────────────
+    %% STYLING
+    %% ─────────────────────────────
+    style START fill:#4CAF50,color:#fff
+    style CHECK fill:#1565C0,color:#fff
+    style QEND fill:#2196F3,color:#fff
+    style TEND fill:#2196F3,color:#fff
+    style TI fill:#9E9E9E,color:#fff
+    style QJ fill:#9E9E9E,color:#fff
+    style QL fill:#FF9800,color:#fff
+    style TL fill:#FF9800,color:#fff
+    style QF fill:#E3F2FD,color:#000
+    style TE fill:#FFF9C4,color:#000
 ```
 
-## Key Components Reference
+## Difference at a Glance
 
-| Component | File | Role |
-|-----------|------|------|
-| `SuggestedTips` | `commons/.../SuggestedTips.kt` | Data model: order, value%, isDefault |
-| `TipSettings` | `commons/.../TipSettings.kt` | Config: enabled, customTipEnabled, list |
-| `TipDisplayItem` | `commons/.../TipDisplayItem.kt` | UI model: calculated amount + percentage |
-| `calculatePercentagesFromDb()` | `Extensions.kt:3599` | Builds TipDisplayItem list from DB |
-| `PayByCardTipSecondaryScreen` | `ui/secondaryScreens/` | Card payment tip selection UI |
-| `PayByTenderTip` | `ui/secondaryScreens/` | Tender/cash tip selection UI |
-| `AddTipSelectionDialog` | `utils/addtiplater/` | Post-payment tip management |
-| `AddTipUnclosedFragment` | `ui/main/fragments/` | Tip on unclosed tickets |
-| `TipSettingsEntity` | `commons/.../TipsSettingsEntity.kt` | Room DB persistence |
+| | QSR | TST |
+|---|---|---|
+| **When tips shown** | On secondary screen during payment | On printed receipt after payment |
+| **Who selects tip** | Customer (at POS screen) | Customer (handwritten on receipt) |
+| **Tip in payment request** | Included immediately | `willTipAddLater = true`, added later |
+| **Receipt print call** | `printReceipt("server")` | `printReceiptLaterTip()` |
+| **Receipt content** | Actual tip amount paid | Suggested tip % lines (tip1/tip2/tip3) |
+| **Post-payment tip entry** | Not needed | `AddTipUnclosedFragment` via dialog |
+| **Key flag** | `IS_QUICK_SERVE = true` | `IS_QUICK_SERVE = false` |
 
-## Flow Summary
+## Key Files
 
-1. **Config** — TipSettings loaded from API at startup, stored in Room DB
-2. **Calculation** — `calculatePercentagesFromDb()` builds 3 tip options (DB values or 18/20/22% fallback)
-3. **Selection** — Secondary screen shows suggested tips with calculated dollar amounts; default pre-highlighted
-4. **Validation** — Tips >50% of order require explicit confirmation
-5. **Payment** — Tip added to total, analytics fired, included in payment request
-6. **Post-Payment** — Cash tips declared via numpad; unclosed ticket tips added via `AddTipSelectionDialog`
+| File | Line | Role |
+|------|------|------|
+| `Constants.kt` | 89 | `IS_QUICK_SERVE` flag |
+| `PayByCardFragment.kt` | 1461 | QSR: trigger `ShowPayByCardTip` secondary screen |
+| `PayByCardFragment.kt` | 1794 | TST: set `willTipAddLater` flag |
+| `PayByCardFragment.kt` | 614 | Branch: `printReceiptLaterTip()` vs `printReceipt()` |
+| `Extensions.kt` | 3599 | `calculatePercentagesFromDb()` — builds tip options |
+| `PayByCardTipSecondaryScreen.kt` | — | QSR card tip selection UI |
+| `PayByTenderTip.kt` | — | QSR tender tip selection UI |
+| `PrinterTemplates.kt` | 2034 | `printServerTips()`, tip receipt lines |
+| `AddTipUnclosedFragment.kt` | — | TST: add tip to unclosed ticket |
 ```
